@@ -51,7 +51,7 @@ class Net(nn.Module):
     def __init__(self,lr,state_dim,action_dim):
         super().__init__()
         # conv 1
-        self.conv1 = nn.Conv2d(state_dim.shape[1],16,kernel_size=5,stride=2)
+        self.conv1 = nn.Conv2d(state_dim[1],16,kernel_size=5,stride=2)
         self.batch1 = nn.BatchNorm2d(16)
         self.relu1 = nn.ReLU()
         self.pool1 = nn.MaxPool2d(kernel_size=2)
