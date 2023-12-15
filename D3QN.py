@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch.optim
+import math
+#input_images_ch = 2
+#batch_size = 16
+#input_images (batch,channel,144,256)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -197,14 +201,47 @@ class ReplayBuffer:
 
         return obs, info, actions, rewards, nx_obs, nx_info, dones
     
-    def warning_up(self):
+    def warming_up(self):
         return self.count > self.batch_size
 
-#input_images_ch = 2
-#batch_size = 16
-    # input_images (batch,channel,144,256)
+class NoisyLinear(): # for noisy net
+    def __init__(self,in_features,out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.u_w = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.sigma_w  = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.u_b = nn.Parameter(torch.Tensor(out_features))
+        self.sigma_b = nn.Parameter(torch.Tensor(out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 初期値設定
+        stdv = 1. / math.sqrt(self.u_w.size(1))
+        self.u_w.data.uniform_(-stdv, stdv)
+        self.u_b.data.uniform_(-stdv, stdv)
+
+        initial_sigma = 0.5 * stdv
+        self.sigma_w.data.fill_(initial_sigma)
+        self.sigma_b.data.fill_(initial_sigma)
+    
+    def forward(self, x): # epsilon w = f(epsilon i)f(epislon j) epislon b = f(epislon j)
+        # 毎回乱数を生成
+        rand_in = self._f(torch.randn(1, self.in_features, device=self.u_w.device))
+        rand_out = self._f(torch.randn(self.out_features, 1, device=self.u_w.device))
+        epsilon_w = torch.matmul(rand_out, rand_in)
+        epsilon_b = rand_out.squeeze()
+
+        w = self.u_w + self.sigma_w * epsilon_w
+        b = self.u_b + self.sigma_b * epsilon_b
+        return F.linear(x, w, b)
+
+    def _f(self, x): # for Factorised Gaussian noise 
+       return torch.sign(x) * torch.sqrt(torch.abs(x))
+    
 class Net(nn.Module):
-    def __init__(self,lr,obs_dim,info_dim,action_dim):
+    def __init__(self,lr,obs_dim,info_dim,action_dim,NoisyNet=False):
         super().__init__()
         # conv 1
         self.conv1 = nn.Conv2d(obs_dim[1],16,kernel_size=5,stride=2)
@@ -223,14 +260,22 @@ class Net(nn.Module):
         self.pool3 = nn.MaxPool2d(kernel_size=2)
         # result shape[Batch,32,7,4]
 
-        #FC 896 + 7(info)
-        self.fc1 = nn.Linear(896+info_dim,128)
-        self.fc2 = nn.Linear(128,64)
+        if NoisyNet:
+            #FC 896 + 7(info)
+            self.fc1 = NoisyLinear(896+info_dim,128)
+            self.fc2 = NoisyLinear(128,64)
 
-        # value function & advantage function(Dueling)
-        self.V = nn.Linear(64,1)
-        self.A = nn.Linear(64,action_dim)
-        
+            # value function & advantage function(Dueling)
+            self.V = NoisyLinear(64,1)
+            self.A = NoisyLinear(64,action_dim)
+            print("using noisy Linear !")
+        else:
+            self.fc1 = nn.Linear(896+info_dim,128)
+            self.fc2 = nn.Linear(128,64)
+
+            self.V = nn.Linear(64,1)
+            self.A = nn.Linear(64,action_dim)
+
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.to(device)
 
@@ -269,7 +314,7 @@ class Net(nn.Module):
 class D3QN():
     def __init__(self, lr, obs_dim, info_dim, action_dim, gamma=0.99, tau=0.005,
                  epsilon=1.0, eps_end=0.01, eps_dec=5e-7, memory_size=5000,
-                 batch_size=16, ckpt_dir="",Prioritized_rp=False):
+                 batch_size=16, ckpt_dir="",Prioritized_rp=False,NoisyNet=False):
         super().__init__()
         self.gamma = gamma #discount factor
         self.tau = tau #
@@ -280,13 +325,16 @@ class D3QN():
         self.batch_size = batch_size
         self.action_space = action_dim
         self.prioritized = Prioritized_rp
-        
-        self.eval_net = Net(lr, obs_dim, info_dim, action_dim)
-        self.target_net = Net(lr, obs_dim, info_dim, action_dim)
+        self.noisyNet = NoisyNet
+
+        self.eval_net = Net(lr, obs_dim, info_dim, action_dim,self.noisyNet)
+        self.target_net = Net(lr, obs_dim, info_dim, action_dim,self.noisyNet)
         if self.prioritized:
             self.memory = Prioritized_replay(obs_dim,info_dim ,memory_size, batch_size)
+            print("Start D3QN with prioritized replay! ")
         else:
             self.memory = ReplayBuffer(obs_dim,info_dim ,memory_size, batch_size)
+            print("Start D3QN with native replay! ")
 
     def soft_update(self, tau=None):#軟更新，在更新target時保持一定比率的
         if tau is None:
@@ -329,12 +377,13 @@ class D3QN():
         self.target_net.load_checkpoint(self.checkpoint_dir + 'Q_target/D3QN_q_target_{}.pth'.format(episode))
         print("Loading target_net success!")
 
-    def learning(self): # with a batch
-        if not self.memory.warning_up():# 檢查memory是否有足夠的transition進行學習
+    def learning(self,tgr_update=False): # with a batch
+        if not self.memory.warming_up():# 檢查memory是否有足夠的transition進行學習
             return
         
         if self.prioritized:
             tree_idx ,obs, info, actions, rewards, nx_obs, nx_info ,dones, ISweight = self.memory.sample_buffer()
+            Isweight_tensor = torch.tensor(ISweight).to(device)
         else :
             obs, info, actions, rewards, nx_obs, nx_info ,dones = self.memory.sample_buffer()
 
@@ -356,17 +405,23 @@ class D3QN():
         q = self.eval_net.forward(obs_tensor, info_tensor,dim=1)[idx, actions_tensor]# q value
 
         if self.prioritized:
-            loss = (torch.FloatTensor(ISweight) * F.mse_loss(q, target.detach())).mean()
+            abs_errors = (torch.abs(q - target).data).cpu().numpy() #計算TD error
+
+            self.memory.batch_update(tree_idx, abs_errors) #更新priority
+
+            loss = (Isweight_tensor * F.mse_loss(q, target.detach())).mean()
         else:
             loss = F.mse_loss(q, target.detach())# calculate loss (q-q')^2
-            
+
         self.eval_net.optimizer.zero_grad()# 清除之前所求得的grad
         loss.backward()# 求grad
         self.eval_net.optimizer.step()# 更新parameters
-        self.reduce_epsilon() #減小epsilon
+        if not self.noisyNet:
+            self.reduce_epsilon() #減小epsilon
 
-        self.soft_update() # soft update target net
-        # self.hard_update() # hard update target net
+        if tgr_update:
+            self.soft_update() # soft update target net
+            # self.hard_update() # hard update target net
     
     def get_epsilon(self):
         return self.epsilon

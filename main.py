@@ -141,7 +141,7 @@ def main():
     # connect to the AirSim simulator
     agent = D3QN(lr=0.001, obs_dim=state_dim, info_dim=7, action_dim=13, gamma=0.99, tau=0.005,
                  epsilon=1.0, eps_end=0.05, eps_dec=5e-7, memory_size=5000,
-                 batch_size=16,ckpt_dir="./checkpoint")
+                 batch_size=16,ckpt_dir="./checkpoint",Prioritized_rp=True,NoisyNet=True)
     # tau for softupdate , gamma for discount factor , lr for learning rate
     # create_dir('/')
     for episode in range(episodes): # training
@@ -163,17 +163,21 @@ def main():
         obs, info, collision_info = get_observation()
         #obs (1, 2, 144, 256)
         while not done :
+            tgr_update = False
             step_count +=1
             action = agent.choose_action(obs,info,isTrain=True)
             nx_obs, nx_info, reward, done, col = step(obs,action,last_action,step_count)# do action and get next obs, reward, info
             last_action = action
             agent.store_transition(obs,info,action,reward,nx_obs,nx_info,done)
-            agent.learning()
+            if step_count%3==0:
+                tgr_update = True
+                
+            agent.learning(tgr_update)
             collision = col
             total_reward += reward
             obs = nx_obs
             info = nx_info
-        print("Episode :{0}, avg_step: {3}, reward {1:.3f}, current epsilon :{2:.3f} ,Collision : {4}".format(eps,total_reward,agent.get_epsilon(),step_count,collision))
+        print("Episode :{0}, avg_step: {3}, reward {1:.3f}, current epsilon :{2:.3f}, Collision : {4}, Mean Reward : {5:.5f}".format(eps,total_reward,agent.get_epsilon(),step_count,collision,total_reward/step_count))
         eps_list.append(eps)
         reward_list.append(total_reward)
         step_list.append(step_count)
@@ -181,13 +185,12 @@ def main():
         if (eps) % 100 == 0:
             agent.save_models(eps)
     # record learning result
-    with open("./result/leanring_result.txt", "w") as fp:
-        for i in len(eps_list):
-            fp.write("%s : %.3f, %d, %d \n" % eps_list[i],reward_list[i],step_list[i],collision_list[i])
-    
     plot_learning_curve(eps_list, reward_list, title='Reward', ylabel='reward',figur_file="./result/reward")
     plot_learning_curve(eps_list, step_list, title='step', ylabel='avg_step',figur_file="./result/step")
 
+    with open("./result/leanring_result.txt", "w") as fp:
+        for i in range(len(eps_list)):
+           fp.write("{0} : {1:.3f}, {2}, {3} \n".format(eps_list[i],reward_list[i],step_list[i],collision_list[i]))
     
 if __name__ == '__main__':
     main()
