@@ -13,7 +13,7 @@ def plot_learning_curve(episodes, records, title, ylabel, figur_file):
     plt.figure()
     plt.plot(episodes, records, linestyle='-', color = 'r')
     plt.title(title)
-    plt.xlabel('episode')
+    plt.xlabel('epoch')
     plt.ylabel(ylabel)
 
     plt.show()

@@ -3,25 +3,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch.optim
-import math
+import os, math
+from setuptools import glob
+import torch as T
+from collections import deque
 #input_images_ch = 2
 #batch_size = 16
 #input_images (batch,channel,144,256)
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
 class SumTree:
     data_pointer = 0
-    def __init__(self, obs_dim, info_dim, memory_size):
+    def __init__(self, obs_dim, info_dim, memory_size, cm_vae):
         self.capacity = memory_size  # for all priority values
+        self.cm_vae = cm_vae
         self.tree = np.zeros((2 * self.capacity - 1))
         # [--------------Parent nodes-------------][-------leaves to recode priority-------]
         #             size: capacity - 1                       size: capacity
-        self.obs_memory = np.zeros((self.capacity, obs_dim[1], obs_dim[2], obs_dim[3]))
+        if self.cm_vae:
+            self.obs_memory = np.zeros((self.capacity, obs_dim))
+        else:
+            self.obs_memory = np.zeros((self.capacity, obs_dim[1], obs_dim[2], obs_dim[3]))
         self.info_memory = np.zeros((self.capacity, info_dim))
         self.action_memory = np.zeros((self.capacity, ))
         self.reward_memory = np.zeros((self.capacity, ))
-        self.next_obs_memory = np.zeros((self.capacity, obs_dim[1], obs_dim[2], obs_dim[3]))
+        if self.cm_vae:
+            self.next_obs_memory = np.zeros((self.capacity, obs_dim))
+        else:
+            self.next_obs_memory = np.zeros((self.capacity, obs_dim[1], obs_dim[2], obs_dim[3]))
         self.next_info_memory = np.zeros((self.capacity, info_dim))
         self.terminal_memory = np.zeros((self.capacity, ), dtype=np.bool_)  # for all transitions
         # [--------------data frame-------------]
@@ -106,14 +115,21 @@ class Prioritized_replay:
     beta_increment_per_sampling = 0.001
     abs_err_upper = 1.  # clipped abs error
 
-    def __init__(self, obs_dim,info_dim ,memory_size, batch_size):
-        self.tree = SumTree(obs_dim,info_dim ,memory_size)
+    def __init__(self, obs_dim,info_dim ,memory_size, batch_size,cm_vae):
+        self.tree = SumTree(obs_dim,info_dim ,memory_size,cm_vae)
         self.batch_size = batch_size
         self.obs_dim = obs_dim
         self.info_dim = info_dim
         self.warm = False
+        self.cm_vae = cm_vae
 
     def store_transition(self, obs, info, action, reward, nx_obs, nx_info, done):
+        """
+        obs = obs.detach().cpu().numpy()
+        info = info.detach().cpu().numpy()
+        nx_obs = nx_obs.detach().cpu().numpy()
+        nx_info = nx_info.detach().cpu().numpy()
+        """
         max_p = np.max(self.tree.tree[-self.tree.capacity:]) # search max priority in tree
         if max_p == 0:
             max_p = self.abs_err_upper
@@ -123,11 +139,17 @@ class Prioritized_replay:
         b_idx = np.empty((self.batch_size,), dtype=np.int32)
 
         # data frame
-        b_obs = np.empty((self.batch_size, self.obs_dim[1], self.obs_dim[2], self.obs_dim[3])) 
+        if self.cm_vae:
+            b_obs = np.empty((self.batch_size, self.obs_dim)) 
+        else :
+            b_obs = np.empty((self.batch_size, self.obs_dim[1], self.obs_dim[2], self.obs_dim[3])) 
         b_info = np.empty((self.batch_size, self.info_dim))
         b_actions = np.empty((self.batch_size,)) # action
         b_rewards =np.empty((self.batch_size,)) # reward
-        b_nx_obs = np.empty((self.batch_size, self.obs_dim[1], self.obs_dim[2], self.obs_dim[3])) # next state
+        if self.cm_vae:
+            b_nx_obs = b_nx_obs = np.empty((self.batch_size, self.obs_dim)) # next state
+        else:
+            b_nx_obs = np.empty((self.batch_size, self.obs_dim[1], self.obs_dim[2], self.obs_dim[3])) # next state
         b_nx_info = np.empty((self.batch_size, self.info_dim))
         b_dones = np.empty((self.batch_size,),dtype=bool) # done 
 
@@ -155,7 +177,7 @@ class Prioritized_replay:
             self.tree.update(ti, p) 
 
     def warming_up(self):
-        if self.tree.data_pointer >= 16:
+        if self.tree.data_pointer >= self.batch_size:
             self.warm = True
         return self.warm
     
@@ -204,6 +226,63 @@ class ReplayBuffer:
     def warming_up(self):
         return self.count > self.batch_size
 
+class NStepMemory(object):
+    # memory buffer to store episodic memory
+    def __init__(self, memory_size=300, n_steps=4, gamma = 0.99):
+        self.buffer = []
+        self.memory_size = memory_size
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.next_idx = 0
+        
+    def push(self, obs, info, action, reward, next_obs, next_info, done):
+        # Tensor to numpy
+        obs = obs.detach().cpu().numpy()
+        info = info.detach().cpu().numpy()
+        next_obs = next_obs.detach().cpu().numpy()
+        next_info = next_info.detach().cpu().numpy()
+
+        data = (obs, info, action, reward, next_obs, next_info, done)
+        if len(self.buffer) <= self.memory_size:    # buffer not full
+            self.buffer.append(data)
+        else:                                       # buffer is full
+            self.buffer[self.next_idx] = data
+        self.next_idx = (self.next_idx + 1) % self.memory_size
+
+    def get(self, i):
+        # sample episodic memory
+        # [obs, info, action, reward, next_obs, next_info, done]
+
+        begin = i
+        finish = i + self.n_steps if(i + self.n_steps < self.size()) else self.size()
+        sum_reward = 0 # n_step rewards
+        data = self.buffer[begin:finish]
+        obs = data[0][0]
+        info = data[0][1]    
+        action = data[0][2]
+        for j in range(len(data)):
+            # compute the n-th reward
+            sum_reward += (self.gamma**j) * data[j][3]
+            if data[j][6]:
+                # manage end of episode
+                next_obs = data[j][4]
+                next_info = data[j][5]
+                done = 1
+                break
+            else:
+                next_obs = data[j][4]
+                next_info = data[j][5]
+                done = 0
+
+        return obs, info, action, sum_reward, next_obs, next_info, done
+    
+    def reset(self):
+        self.buffer = []
+        self.next_idx = 0
+
+    def size(self):
+        return len(self.buffer)
+
 class NoisyLinear(): # for noisy net
     def __init__(self,in_features,out_features):
         super().__init__()
@@ -240,7 +319,7 @@ class NoisyLinear(): # for noisy net
     def _f(self, x): # for Factorised Gaussian noise 
        return torch.sign(x) * torch.sqrt(torch.abs(x))
     
-class Net(nn.Module):
+class CNN_Net(nn.Module): # cnn net
     def __init__(self,lr,obs_dim,info_dim,action_dim,NoisyNet=False):
         super().__init__()
         # conv 1
@@ -254,32 +333,24 @@ class Net(nn.Module):
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool2d(kernel_size=2)
         #conv3
-        self.conv3 = nn.Conv2d(32,32,kernel_size=3,stride=1,padding=1)
-        self.batch3 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32,64,kernel_size=3,stride=1,padding=1)
+        self.batch3 = nn.BatchNorm2d(64)
         self.relu3 = nn.ReLU()
         self.pool3 = nn.MaxPool2d(kernel_size=2)
-        # result shape[Batch,32,7,4]
+        # result shape[Batch,64,7,4]
+        self.fc1 = nn.Linear(1792+info_dim,128)
+        self.fc2 = nn.Linear(128,64)
 
-        if NoisyNet:
-            #FC 896 + 7(info)
-            self.fc1 = NoisyLinear(896+info_dim,128)
-            self.fc2 = NoisyLinear(128,64)
+        self.VH = nn.Linear(64,32)
+        self.AH = nn.Linear(64,32)
 
-            # value function & advantage function(Dueling)
-            self.V = NoisyLinear(64,1)
-            self.A = NoisyLinear(64,action_dim)
-            print("using noisy Linear !")
-        else:
-            self.fc1 = nn.Linear(896+info_dim,128)
-            self.fc2 = nn.Linear(128,64)
-
-            self.V = nn.Linear(64,1)
-            self.A = nn.Linear(64,action_dim)
+        self.V = nn.Linear(32,1)
+        self.A = nn.Linear(32,action_dim)
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.to(device)
 
-    def forward(self,x,info,dim=0):
+    def forward(self,x,info,dim=1):
         out = self.conv1(x)
         out = self.batch1(out)
         out = self.relu1(out)
@@ -300,9 +371,13 @@ class Net(nn.Module):
 
         out = self.fc1(out)
         out = self.fc2(out)
-        V = self.V(out)
-        A = self.A(out)
-        Q = V + A - torch.mean(A,dim=-1,keepdim=True)
+
+        vh = F.relu(self.VH(out))
+        ah = F.relu(self.AH(out))
+
+        V = self.V(vh)
+        A = self.A(ah)
+        Q = V + A - torch.mean(A,dim=1,keepdim=True)
         return Q
         
     def save_checkpoint(self, checkpoint_file):
@@ -311,117 +386,226 @@ class Net(nn.Module):
     def load_checkpoint(self, checkpoint_file):
         self.load_state_dict(torch.load(checkpoint_file))
 
-class D3QN():
-    def __init__(self, lr, obs_dim, info_dim, action_dim, gamma=0.99, tau=0.005,
-                 epsilon=1.0, eps_end=0.01, eps_dec=5e-7, memory_size=5000,
-                 batch_size=16, ckpt_dir="",Prioritized_rp=False,NoisyNet=False):
+class Noisy_Net(nn.Module):
+    def __init__(self,lr,obs_dim,info_dim,action_dim,NoisyNet=False):
         super().__init__()
-        self.gamma = gamma #discount factor
-        self.tau = tau #
+
+        self.fc1 = NoisyLinear(obs_dim+info_dim,128)
+        self.fc2 = NoisyLinear(128,64)
+
+        # value function & advantage function(Dueling)
+        self.V = NoisyLinear(64,1)
+        self.A = NoisyLinear(64,action_dim)
+        print("using noisy Linear !")
+        self.optimizer = torch.optim.SGD(self.parameters(), lr=lr)
+        self.to(device)
+
+    def forward(self,x):
+        x = self.relu1(self.fc1(x))
+        h = self.relu2(self.fc2(x))
+        V = self.V(h)
+        A = self.A(h) 
+        Q = V + A - torch.mean(A,dim=-1,keepdim=True)
+        return Q
+
+class D3QN_cnn():
+    
+    def __init__(self, obs_dim, info_dim, action_dim, lr, gamma, epsilon, update_freq, steps, path):
+        super().__init__()
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.q_net = CNN_Net(lr, obs_dim, info_dim, action_dim).to(self.device) # cat your input before forward
+        self.target_q_net = CNN_Net(lr, obs_dim, info_dim, action_dim).to(self.device) # cat your input before forward
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr = lr)
+        self.record_path = path
+        self.action_dim = action_dim
+        self.eps_step = 0 # doing how many step
+        self.update_count = 0 # count for update target network
+        self.gamma = gamma 
+        self.tgr_update_freq = update_freq
         self.epsilon = epsilon
-        self.eps_min = eps_end
-        self.eps_dec = eps_dec
-        self.checkpoint_dir = ckpt_dir # checkpoint save 
-        self.batch_size = batch_size
-        self.action_space = action_dim
-        self.prioritized = Prioritized_rp
-        self.noisyNet = NoisyNet
-
-        self.eval_net = Net(lr, obs_dim, info_dim, action_dim,self.noisyNet)
-        self.target_net = Net(lr, obs_dim, info_dim, action_dim,self.noisyNet)
-        if self.prioritized:
-            self.memory = Prioritized_replay(obs_dim,info_dim ,memory_size, batch_size)
-            print("Start D3QN with prioritized replay! ")
-        else:
-            self.memory = ReplayBuffer(obs_dim,info_dim ,memory_size, batch_size)
-            print("Start D3QN with native replay! ")
-
-    def soft_update(self, tau=None):#軟更新，在更新target時保持一定比率的
-        if tau is None:
-            tau = self.tau
-
-        for q_target_params, q_eval_params in zip(self.target_net.parameters(), self.eval_net.parameters()):
-            q_target_params.data.copy_(tau * q_eval_params + (1 - tau) * q_target_params)
-        # print("soft update")
-
-    def hard_update(self): # 過幾回合後將eval網路權重複製給target網路
-        self.target_net.load_state_dict(self.eval_net.state_dict())
-        # print("hard update")
-    
-    def store_transition(self, obs, info, action, reward, nx_obs, nx_info, done):
-        self.memory.store_transition(obs, info, action, reward, nx_obs, nx_info, done)
-
-    def choose_action(self, observation,info, isTrain=True): # forward network
-        obs = torch.from_numpy(observation).to(device)
-        info = torch.from_numpy(info).to(device)
-        q_values = self.eval_net.forward(obs,info) # get each action`s Q value
-        action = torch.argmax(q_values).item()# 加入item()才可以拿到index 否則會回傳如tensor(5)
-
-        if(np.random.random() < self.epsilon) and isTrain:
-            action = np.random.choice(self.action_space)
-        return action
-
-    def reduce_epsilon(self):
-        self.epsilon = self.epsilon - self.eps_dec \
-            if self.epsilon > self.eps_min else self.eps_min
-
-    def save_models(self, episode):
-        self.eval_net.save_checkpoint(self.checkpoint_dir + '/eval/D3QN_q_eval_{}.pth'.format(episode))
-        print("Saving eval_net success!")
-        self.target_net.save_checkpoint(self.checkpoint_dir + '/target/D3QN_q_target_{}.pth'.format(episode))
-        print("Saving target_net success!")
-
-    def load_models(self, episode):
-        self.eval_net.load_checkpoint(self.checkpoint_dir + 'Q_eval/D3QN_q_eval_{}.pth'.format(episode))
-        print("Loading eval_net success!")
-        self.target_net.load_checkpoint(self.checkpoint_dir + 'Q_target/D3QN_q_target_{}.pth'.format(episode))
-        print("Loading target_net success!")
-
-    def learning(self,tgr_update=False): # with a batch
-        if not self.memory.warming_up():# 檢查memory是否有足夠的transition進行學習
-            return
+        self.init_eps = 1.0
+        self.min_eps = 0.05
+        self.eps_decay = 20000
+        self.validation = False
         
-        if self.prioritized:
-            tree_idx ,obs, info, actions, rewards, nx_obs, nx_info ,dones, ISweight = self.memory.sample_buffer()
-            Isweight_tensor = torch.tensor(ISweight).to(device)
-        else :
-            obs, info, actions, rewards, nx_obs, nx_info ,dones = self.memory.sample_buffer()
+        print("Start CNN D3QN")
+        #self.count_params(self.q_net)
+        #summary(self.q_net, (2, 144, 256))
 
-        idx = torch.arange(self.batch_size, dtype=torch.long).to(device)
-        obs_tensor = torch.tensor(obs, dtype=torch.float32).to(device)
-        info_tensor = torch.tensor(info,dtype=torch.float).to(device)
-        actions_tensor = torch.tensor(actions, dtype=torch.long).to(device)
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float).to(device)
-        nx_obs_tensor = torch.tensor(nx_obs, dtype=torch.float32).to(device)
-        nx_info_tensor = torch.tensor(nx_info,dtype=torch.float).to(device)
-        dones_tensor = torch.tensor(dones).to(device)
-
+    def choose_action(self, obs, uav_info):
         with torch.no_grad():
-            # Double DQN
-            q_ = self.target_net.forward(nx_obs_tensor,nx_info_tensor,dim=1)# target net 進行估計target value
-            max_actions = torch.argmax(self.eval_net.forward(nx_obs_tensor,nx_info_tensor,dim=1), dim=-1)# eval net找出最大Q值action
-            target = rewards_tensor + self.gamma * q_[idx, max_actions] #計算出target Q value
+            q_value = self.q_net(obs,uav_info)
+
+        if self.validation:
+            action = q_value.cpu().detach().argmax(dim=1).item()
+            return action
         
-        q = self.eval_net.forward(obs_tensor, info_tensor,dim=1)[idx, actions_tensor]# q value
+        self.epsilon = self.min_eps + (self.init_eps - self.min_eps) * math.exp(-1.0 * self.eps_step / self.eps_decay)
+        self.eps_step+=1
 
-        if self.prioritized:
-            abs_errors = (torch.abs(q - target).data).cpu().numpy() #計算TD error
-
-            self.memory.batch_update(tree_idx, abs_errors) #更新priority
-
-            loss = (Isweight_tensor * F.mse_loss(q, target.detach())).mean()
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.action_dim)
         else:
-            loss = F.mse_loss(q, target.detach())# calculate loss (q-q')^2
+            action = q_value.cpu().detach().argmax(dim=1).item()
 
-        self.eval_net.optimizer.zero_grad()# 清除之前所求得的grad
-        loss.backward()# 求grad
-        self.eval_net.optimizer.step()# 更新parameters
-        if not self.noisyNet:
-            self.reduce_epsilon() #減小epsilon
-
-        if tgr_update:
-            self.soft_update() # soft update target net
-            # self.hard_update() # hard update target net
+        return action
     
-    def get_epsilon(self):
-        return self.epsilon
+    def update(self,loss):
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.update_count % self.tgr_update_freq == 0:
+            print("[+] Update from target network")
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.update_count += 1
+    
+    def save_models(self, episode):
+        checkpoint = {
+            "net": self.q_net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "eps_step": self.eps_step
+        }
+        torch.save(checkpoint, ".//{0}//model//D3QN_{1}.pth".format(self.record_path,episode))
+    
+    def load_models(self):
+
+        files = glob.glob('.//{}//model//*.pth'.format(self.record_path))
+        files.sort(key=os.path.getmtime)
+        if len(files) > 0:
+            print("[+] Loading D3QN " + files[-1] + " ...")
+            checkpoint = torch.load(files[-1])
+            self.q_net.load_state_dict(checkpoint["net"])
+            self.target_q_net.load_state_dict(checkpoint["net"])
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.eps_step = checkpoint["eps_step"]
+
+    def count_params(model):
+        size_model = 0
+        for param in model.parameters():
+            if param.data.is_floating_point():
+                size_model += param.numel() * torch.finfo(param.data.dtype).bits
+            else:
+                size_model += param.numel() * torch.iinfo(param.data.dtype).bits
+            print(f"model size: {size_model} / bit | {size_model / 8e6:.2f} / MB")
+
+class QNET(nn.Module): # cat your input before forward
+    def __init__(self, input_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim,128)
+        self.fc2 = nn.Linear(128,64)
+
+        self.VH = nn.Linear(64,32)
+        self.AH = nn.Linear(64,32)
+
+        self.V = nn.Linear(32,1)
+        self.A = nn.Linear(32,action_dim)
+
+    def forward(self,x):
+        x = F.relu(self.fc1(x))
+        h = F.relu(self.fc2(x))
+
+        vh = F.relu(self.VH(h))
+        ah = F.relu(self.AH(h))
+
+        V = self.V(vh)
+        A = self.A(ah)
+        Q = V + A - torch.mean(A,dim=1,keepdim=True)
+        return Q
+
+class D3QN():
+    def __init__(self, input_dim, action_dim, lr, gamma, epsilon, update_freq, steps, path,validation=False):
+        super(D3QN, self).__init__()
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.q_net = QNET(input_dim,action_dim).to(self.device) # cat your input before forward
+        self.target_q_net = QNET(input_dim,action_dim).to(self.device) # cat your input before forward
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr = lr)
+        self.record_path = path
+        self.action_dim = action_dim
+        self.eps_step = 0 # doing how many step
+        self.update_count = 0 # count for update target network
+        self.gamma = gamma 
+        self.tgr_update_freq = update_freq
+        self.epsilon = epsilon
+        self.init_eps = 1.0
+        self.min_eps = 0.05
+        self.eps_decay = 20000
+        self.validation = validation
+        
+    def choose_action(self, latent, uav_info):
+        x = torch.cat((latent,uav_info),dim=1)
+        with torch.no_grad():
+            q_value = self.q_net(x)
+
+        if self.validation:
+            action = q_value.cpu().detach().argmax(dim=1).item()
+            return action
+        
+        self.epsilon = self.min_eps + (self.init_eps - self.min_eps) * math.exp(-1.0 * self.eps_step / self.eps_decay)
+        self.eps_step+=1
+
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.action_dim)
+        else:
+            action = q_value.cpu().detach().argmax(dim=1).item()
+
+        return action
+    
+    def update(self,loss):
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.update_count % self.tgr_update_freq == 0:
+            print("[+] Update from target network")
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.update_count += 1
+    
+    def save_models(self, episode):
+        checkpoint = {
+            "net": self.q_net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "eps_step": self.eps_step
+        }
+        torch.save(checkpoint, ".//{0}//model//D3QN_{1}.pth".format(self.record_path,episode))
+    
+    def load_models(self):
+
+        files = glob.glob('.//{}//model//*.pth'.format(self.record_path))
+        files.sort(key=os.path.getmtime)
+        if len(files) > 0:
+            print("[+] Loading D3QN " + files[-1] + " ...")
+            checkpoint = torch.load(files[-1])
+            self.q_net.load_state_dict(checkpoint["net"])
+            self.target_q_net.load_state_dict(checkpoint["net"])
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self.eps_step = checkpoint["eps_step"]
+            
+"""
+pr = Prioritized_replay(128,7,1000,2,True)
+b_idx, b_latent, b_info, b_action, b_rewards, b_nx_latent, b_nx_info, b_dones, ISWeight = pr.sample_buffer()
+b_dones = [[True],[True]]
+
+b_latent = T.tensor(np.array(b_latent, dtype=np.float32), dtype=T.float)
+b_info = T.tensor(np.array(b_info, dtype=np.float32), dtype=T.float)
+b_action = T.tensor(np.array(b_action, dtype=np.float32), dtype=T.float).unsqueeze(1)
+b_rewards = T.tensor(np.array(b_rewards, dtype=np.float32), dtype=T.float).unsqueeze(1)
+b_nx_latent = T.tensor(np.array(b_nx_latent, dtype=np.float32), dtype=T.float)
+b_nx_info = T.tensor(np.array(b_nx_info, dtype=np.float32), dtype=T.float)
+b_dones = T.tensor(np.array(b_dones, dtype=np.float32), dtype=T.float)
+b_ISWeight = T.tensor(np.array(b_dones, dtype=np.float32), dtype=T.float)
+
+print("b_idx:", b_idx.shape)
+print("b_latent:", b_latent.shape)
+print("b_info:", b_info.shape)
+print("b_action:", b_action.shape)
+print("b_rewards:", b_rewards.shape)
+print("b_nx_latent:", b_nx_latent.shape)
+print("b_nx_info:", b_nx_info.shape)
+print("b_dones:", b_dones.shape)
+
+#ction = torch.randn(2,13)
+max_a = T.argmax(b_action,dim=1,keepdim=True)
+print("max:", max_a.shape)
+print("gather:",b_action.gather(1,max_a))
+"""
