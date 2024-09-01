@@ -15,3 +15,7 @@
 - Decoder
 ![CMVAE_decoder](https://github.com/user-attachments/assets/38836620-e7b3-402b-9f71-f25ae129c077)
 
+## Training Result
+
+## Test Result Demo 
+https://youtu.be/xtk49do-xW0
