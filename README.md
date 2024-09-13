@@ -18,6 +18,6 @@
 ## Training Result
 
 ## Test Result Demo 
-https://youtu.be/xtk49do-xW0
+[![Watch the video](https://img.youtube.com/vi/xtk49do-xW0/maxresdefault.jpg)](https://youtu.be/xtk49do-xW0)
 ## Realfly Test
-https://www.youtube.com/watch?v=oULu6L_CSug
+[![Watch the video](https://img.youtube.com/vi/oULu6L_CSug/maxresdefault.jpg)](https://www.youtube.com/watch?v=oULu6L_CSug)
